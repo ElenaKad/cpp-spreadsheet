@@ -1,146 +1,193 @@
-#include "cell.h" 
-#include "sheet.h"
+#include "cell.h"
 
 #include <cassert>
 #include <iostream>
 #include <string>
 #include <optional>
+#include <stack>
 
-Cell::Cell(Sheet& sheet) : impl_(std::make_unique<EmptyImpl>()),
-                           sheet_(sheet) {}
-Cell::~Cell() = default;
+#include "sheet.h"
 
-void Cell::Set(std::string text) {
-    std::unique_ptr<Impl> iterim;
+class Cell::Impl {
+public:
+    virtual ~Impl() = default;
+    virtual Value GetValue() const = 0;
+    virtual std::string GetText() const = 0;
+    virtual std::vector<Position> GetReferencedCells() const { return {}; }
+    virtual void InvalidateCache() {}
+};
 
-    if (text.empty()) {
-        iterim = std::make_unique<EmptyImpl>();
-    } else if (text.size() >= 2 && text[0] == FORMULA_SIGN) {
-        iterim = std::make_unique<FormulaImpl>(std::move(text), sheet_);
-    } else {
-        iterim= std::make_unique<TextImpl>(std::move(text));
+class Cell::EmptyImpl : public Impl {
+public:
+    Value GetValue() const override {
+        return "";
     }
 
-    if (CheckCircularDependencies(*iterim)) {
-        throw CircularDependencyException("circular dependency detected");
+    std::string GetText() const override {
+        return "";
     }
+};
 
-    // Обновление зависимостей
-    for (Cell* used : using_cells_) {
-        used->calculated_cells_.erase(this);
-    }
-
-    using_cells_.clear();
-
-    for (const auto& pos : impl_->GetReferencedCells()) {
-        Cell* used = sheet_.Get_Cell(pos);
-        if (!used ) {
-            sheet_.SetCell(pos, "");
-            used  = sheet_.Get_Cell(pos);
-        }
-        using_cells_.insert(used );
-        used ->calculated_cells_.insert(this);
-    }
-
-    impl_ = std::move(iterim);
-
-    // Инвалидация кеша
-    ResetCache(true);
-}
-
-bool Cell::CheckCircularDependencies(const Impl& new_impl) const {
-    const auto& new_ref_cells = new_impl.GetReferencedCells();
-
-    if (!new_ref_cells.empty()) {
-        std::set<const Cell*> calc_;
-        std::vector<const Cell*> insert_;
-        std::set<const Cell*> using_;
-
-        for (const auto& position : new_ref_cells) {
-            const Cell* ref_cell = sheet_.Get_Cell(position);
-            if (ref_cell) {
-                using_.insert(ref_cell);
-            } else {
-                sheet_.SetCell(position, "");
-                using_.insert(sheet_.Get_Cell(position));
-            }
-        }
-
-        insert_.push_back(this);
-
-        while (!insert_.empty()) {
-            const Cell* current = insert_.back();
-            insert_.pop_back();
-            calc_.insert(current);
-
-            for (const Cell* dependent : current->calculated_cells_) {
-                if (calc_.find(dependent) == calc_.end()) {
-                    insert_.push_back(dependent);
-                } else {
-                    return true; // Найдена циклическая зависимость
-                }
-            }
+class Cell::TextImpl : public Impl {
+public:
+    TextImpl(std::string text) : text_(std::move(text)) {
+        if (text_.empty()) {
+            throw std::logic_error("");
         }
     }
 
-    return false; // Циклических зависимостей не найдено
-}
-
-
-
-void Cell::Clear() {
-    impl_ = std::make_unique<EmptyImpl>();
-}
-
-Cell::Value Cell::GetValue() const {return impl_->GetValue();}
-std::string Cell::GetText() const {return impl_->GetText();}
-std::vector<Position> Cell::GetReferencedCells() const {return impl_->GetReferencedCells();}
-bool Cell::IsReferenced() const {return !calculated_cells_.empty();}
-
-void Cell::ResetCache(bool flag = false) {
-    if (impl_->HasCache() || flag) {
-        impl_->ResetCache();
-
-        for (Cell* dependent : calculated_cells_) {
-            dependent->ResetCache();
+    Value GetValue() const override {
+        if (text_[0] == ESCAPE_SIGN) {
+            return text_.substr(1);
         }
-    }
-}
-
-std::vector<Position> Cell::Impl::GetReferencedCells() const {return {};}
-bool Cell::Impl::HasCache() {return true;}
-void Cell::Impl::ResetCache() {}
-
-Cell::Value Cell::EmptyImpl::GetValue() const {return "";}
-std::string Cell::EmptyImpl::GetText() const {return "";}
-
-Cell::TextImpl::TextImpl(std::string text) : text_(std::move(text)) {}
-
-Cell::Value Cell::TextImpl::GetValue() const {
-
-    if (text_.empty()) {
-        throw FormulaException("it is empty impl, not text");
-
-    } else if (text_.at(0) == ESCAPE_SIGN) {
-        return text_.substr(1);
-
-    } else {
         return text_;
     }
+    
+    std::string GetText() const override {
+        return text_;
+    }
+
+private:
+    std::string text_;
+};
+
+class Cell::FormulaImpl : public Impl {
+public:
+    explicit FormulaImpl(std::string expression, const SheetInterface& sheet)
+        : sheet_(sheet) {
+        if (expression.empty() || expression[0] != FORMULA_SIGN) {
+            throw std::logic_error("");
+        }
+        formula_ptr_ = ParseFormula(expression.substr(1));
+    }
+    
+    Value GetValue() const override {
+        if (!cache_) {
+            cache_ = formula_ptr_->Evaluate(sheet_);
+        }
+        auto value = formula_ptr_->Evaluate(sheet_);
+        if (std::holds_alternative<double>(value)) {
+            return std::get<double>(value);
+        }
+        return std::get<FormulaError>(value);
+    }
+    
+    std::string GetText() const override {
+        return FORMULA_SIGN + formula_ptr_->GetExpression();
+    }
+    
+    void InvalidateCache() override {
+        cache_.reset();
+    }  
+    
+    std::vector<Position> GetReferencedCells() const {
+        return formula_ptr_->GetReferencedCells();
+    }
+    
+private:
+    std::unique_ptr<FormulaInterface> formula_ptr_;
+    const SheetInterface& sheet_;
+    mutable std::optional<FormulaInterface::Value> cache_;
+};
+
+std::vector<Position> Cell::GetReferencedCells() const {
+    return impl_->GetReferencedCells();
 }
 
-std::string Cell::TextImpl::GetText() const {return text_;}
+Cell::Cell(Sheet& sheet)
+    :impl_(std::make_unique<EmptyImpl>())
+    , sheet_(sheet) {
+    }
 
-Cell::FormulaImpl::FormulaImpl(std::string text, SheetInterface& sheet) : formula_ptr_(ParseFormula(text.substr(1)))
-        , sheet_(sheet) {}
-
-Cell::Value Cell::FormulaImpl::GetValue() const {
-
-    if (!cache_) {cache_ = formula_ptr_->Evaluate(sheet_);}
-    return std::visit([](auto& helper){return Value(helper);}, *cache_);
+Cell::~Cell() {
 }
 
-std::string Cell::FormulaImpl::GetText() const {return FORMULA_SIGN + formula_ptr_->GetExpression();}
-std::vector<Position> Cell::FormulaImpl::GetReferencedCells() const {return formula_ptr_->GetReferencedCells();}
-bool Cell::FormulaImpl::HasCache() {return cache_.has_value();}
-void Cell::FormulaImpl::ResetCache() {cache_.reset();}
+void Cell::Set(std::string text) {
+    std::unique_ptr<Impl> impl;
+
+    if (text.empty()) {
+        impl = std::make_unique<EmptyImpl>();
+    }
+    else if (text.size() > 1 && text[0] == FORMULA_SIGN) {
+        impl = std::make_unique<FormulaImpl>(std::move(text), sheet_);
+    }
+    else {
+        impl = std::make_unique<TextImpl>(std::move(text));
+    }
+
+    if (WouldIntroduceCircularDependency(*impl)) {
+        throw CircularDependencyException("");
+    }
+    impl_ = std::move(impl);
+
+    for (Cell* outgoing : r_nodes_) {
+        outgoing->l_nodes_.erase(this);
+    }
+
+    r_nodes_.clear();
+    
+    for (const auto& pos : impl_->GetReferencedCells()) {
+        Cell* outgoing = sheet_.GetCellPtr(pos);
+        
+        if (!outgoing) {
+            sheet_.SetCell(pos, "");
+            outgoing = sheet_.GetCellPtr(pos);
+        }
+
+        r_nodes_.insert(outgoing);
+        outgoing->l_nodes_.insert(this);
+    }
+
+    InvalidateCacheRecursive(true);
+}
+
+void Cell::InvalidateCacheRecursive(bool force) {
+    impl_->InvalidateCache();
+
+    for (Cell* incoming : l_nodes_) {
+        incoming->InvalidateCacheRecursive();
+    }
+}
+
+bool Cell::WouldIntroduceCircularDependency(const Impl& new_impl) const {
+    if (new_impl.GetReferencedCells().empty()) {
+        return false;
+    }
+
+    std::unordered_set<const Cell*> referenced;
+    for (const auto& pos : new_impl.GetReferencedCells()) {
+        referenced.insert(sheet_.GetCellPtr(pos));
+    }
+
+    std::unordered_set<const Cell*> visited;
+    std::stack<const Cell*> to_visit;
+    to_visit.push(this);
+    while (!to_visit.empty()) {
+        const Cell* current = to_visit.top();
+        to_visit.pop();
+        visited.insert(current);
+
+        if (referenced.find(current) != referenced.end()) {
+            return true;
+        }
+
+        for (const Cell* incoming : current->l_nodes_) {
+            if (visited.find(incoming) == visited.end()) {
+                to_visit.push(incoming);
+            }
+        }
+    }
+
+    return false;
+}
+
+void Cell::Clear() {
+	impl_ = std::make_unique<EmptyImpl>();
+}
+
+Cell::Value Cell::GetValue() const {
+	return impl_->GetValue();
+}
+std::string Cell::GetText() const {
+	return impl_->GetText();
+}
